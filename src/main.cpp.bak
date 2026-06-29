@@ -1,0 +1,185 @@
+#include <Arduino.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+#include "config.h"
+#include "wifi_manager.h"
+#include "api_client.h"
+#include "rfid_reader.h"
+#include "session_manager.h"
+#include "status_led.h"
+#include "audio_input.h"
+#include "audio_output.h"
+
+// ─── State Machine ──────────────────────────────────────
+enum State {
+    STATE_IDLE_UNAUTH,
+    STATE_IDLE_AUTH,
+    STATE_AUTH_PENDING,
+    STATE_RECORDING,    // future
+    STATE_SENDING,      // future
+    STATE_PLAYING,      // future
+    STATE_ERROR,
+};
+
+// ─── Module Instances ───────────────────────────────────
+WifiManager    wifiManager;
+ApiClient      apiClient;
+RfidReader     rfidReader;
+SessionManager sessionManager;
+StatusLed      statusLed;
+AudioInput     audioInput;
+AudioOutput    audioOutput;
+
+State currentState = STATE_IDLE_UNAUTH;
+unsigned long errorStartTime = 0;
+
+// ─── Forward Declarations ───────────────────────────────
+void handleRfidTap(const String& uid);
+void transitionToError();
+
+// ─── Setup ──────────────────────────────────────────────
+void setup() {
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("  Smart University Assistant - ESP32");
+    Serial.println("========================================");
+    Serial.flush();
+
+    // Initialize modules
+    Serial.println("[DBG] before statusLed"); Serial.flush();
+    statusLed.begin();
+    Serial.println("[DBG] before statusLed pattern"); Serial.flush();
+    statusLed.setPattern(PATTERN_SLOW_BLINK);
+    Serial.println("[DBG] before wifi"); Serial.flush();
+    wifiManager.begin();
+
+    if (wifiManager.isConnected()) {
+        if (apiClient.healthCheck()) {
+            Serial.println("[Main] Backend is reachable.");
+        } else {
+            Serial.println("[Main] WARNING: Backend not reachable.");
+        }
+    }
+
+    rfidReader.begin();
+    audioInput.begin();
+    audioOutput.begin();
+
+    statusLed.setPattern(PATTERN_OFF);
+    Serial.println("[Main] Ready. Waiting for RFID tap...");
+    Serial.println();
+}
+
+// ─── Main Loop ──────────────────────────────────────────
+void loop() {
+    statusLed.update();
+    sessionManager.checkTimeouts();
+
+    // If session expired while in IDLE_AUTH, go back to IDLE_UNAUTH
+    if (currentState == STATE_IDLE_AUTH && !sessionManager.isAuthenticated()) {
+        currentState = STATE_IDLE_UNAUTH;
+        statusLed.setPattern(PATTERN_OFF);
+        Serial.println("[Main] Session expired -> IDLE_UNAUTH");
+    }
+
+    switch (currentState) {
+
+        case STATE_IDLE_UNAUTH:
+        case STATE_IDLE_AUTH: {
+            // Check Wi-Fi
+            wifiManager.ensureConnected();
+
+            // Poll RFID
+            rfidReader.poll();
+            if (rfidReader.cardDetected()) {
+                handleRfidTap(rfidReader.getLastUID());
+                break;
+            }
+
+            // Future: voice recording trigger (will be added in audio phase)
+            break;
+        }
+
+        case STATE_AUTH_PENDING:
+            // This state is handled synchronously in handleRfidTap()
+            // so we should never actually be in this state during loop()
+            break;
+
+        case STATE_RECORDING:
+            // Future: pump I2S reads
+            break;
+
+        case STATE_SENDING:
+            // Future: HTTP request to voice endpoint
+            break;
+
+        case STATE_PLAYING:
+            // Future: pump MP3 decoder
+            // audioOutput.loop();
+            // if (!audioOutput.isPlaying()) { ... }
+            break;
+
+        case STATE_ERROR:
+            if (millis() - errorStartTime > 2000) {
+                currentState = sessionManager.isAuthenticated()
+                    ? STATE_IDLE_AUTH : STATE_IDLE_UNAUTH;
+                statusLed.setPattern(
+                    sessionManager.isAuthenticated() ? PATTERN_SOLID : PATTERN_OFF);
+            }
+            break;
+    }
+
+    delay(10);  // small yield to prevent watchdog issues
+}
+
+// ─── RFID Tap Handler ───────────────────────────────────
+void handleRfidTap(const String& uid) {
+    // If currently authenticated
+    if (sessionManager.isAuthenticated()) {
+        if (uid == sessionManager.getAuthenticatedUid()) {
+            // Same card: logout
+            Serial.printf("[Main] Same card re-tap -> logout (UID: %s)\n", uid.c_str());
+            sessionManager.clearAuth();
+            currentState = STATE_IDLE_UNAUTH;
+            statusLed.setPattern(PATTERN_OFF);
+            return;
+        } else {
+            // Different card: switch user
+            Serial.printf("[Main] Different card -> switching user (new UID: %s)\n", uid.c_str());
+            sessionManager.clearAuth();
+        }
+    }
+
+    // Authenticate with backend
+    currentState = STATE_AUTH_PENDING;
+    statusLed.setPattern(PATTERN_FAST_BLINK);
+
+    if (!wifiManager.isConnected()) {
+        Serial.println("[Main] No Wi-Fi, cannot authenticate.");
+        transitionToError();
+        return;
+    }
+
+    AuthResult result = apiClient.postRfidAuth(uid);
+
+    if (result.success) {
+        sessionManager.setAuth(result.token, result.role, uid);
+        currentState = STATE_IDLE_AUTH;
+        statusLed.setPattern(PATTERN_AUTH_SUCCESS);
+        Serial.println("[Main] -> IDLE_AUTH");
+    } else {
+        Serial.printf("[Main] Auth failed: %s\n", result.error.c_str());
+        transitionToError();
+    }
+}
+
+// ─── Helpers ────────────────────────────────────────────
+void transitionToError() {
+    currentState = STATE_ERROR;
+    errorStartTime = millis();
+    statusLed.setPattern(PATTERN_ERROR);
+}

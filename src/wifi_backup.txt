@@ -1,0 +1,95 @@
+// ═══════════════════════════════════════════════════════════════
+// WIFI BACKUP - Restored functionality when WiFi is needed again
+// ═══════════════════════════════════════════════════════════════
+// To restore:
+// 1. Copy wifiManager.begin() back to setup()
+// 2. Copy wifiManager.ensureConnected() back to loop()
+// 3. Copy backend health check back to setup()
+// 4. Copy WiFi check in handleRfidTap() back
+// 5. Restore apiClient.postRfidAuth() call
+// ═══════════════════════════════════════════════════════════════
+
+// ───────────────────────────────────────────────────────────────
+// 1. INCLUDES (already in main.cpp)
+// ───────────────────────────────────────────────────────────────
+// #include "wifi_manager.h"
+// #include "api_client.h"
+
+// ───────────────────────────────────────────────────────────────
+// 2. MODULE INSTANCE (already in main.cpp)
+// ───────────────────────────────────────────────────────────────
+// WifiManager    wifiManager;
+// ApiClient      apiClient;
+
+// ───────────────────────────────────────────────────────────────
+// 3. SETUP - WiFi Initialization
+// ───────────────────────────────────────────────────────────────
+// Add this in setup() after LED initialization:
+
+    // Wait for power to stabilize
+    delay(2000);
+
+    // Initialize WiFi
+    Serial.println("[DBG] Initializing WiFi...");
+    wifiManager.begin();
+
+    // Check backend when WiFi connects
+    if (wifiManager.isConnected()) {
+        if (apiClient.healthCheck()) {
+            Serial.println("[Main] Backend is reachable.");
+        } else {
+            Serial.println("[Main] WARNING: Backend not reachable.");
+        }
+    }
+
+// ───────────────────────────────────────────────────────────────
+// 4. LOOP - WiFi Maintain Connection
+// ───────────────────────────────────────────────────────────────
+// Add this inside the switch statement in loop():
+
+    // Check WiFi
+    wifiManager.ensureConnected();
+
+// ───────────────────────────────────────────────────────────────
+// 5. RFID Handler - Backend Authentication
+// ───────────────────────────────────────────────────────────────
+// Replace the simulated auth in handleRfidTap() with this:
+
+    // Authenticate with backend
+    currentState = STATE_AUTH_PENDING;
+    statusLed.setPattern(PATTERN_FAST_BLINK);
+
+    if (!wifiManager.isConnected()) {
+        Serial.println("[Main] No WiFi, cannot authenticate.");
+        currentState = STATE_IDLE_UNAUTH;
+        statusLed.setPattern(PATTERN_OFF);
+        return;
+    }
+
+    AuthResult result = apiClient.postRfidAuth(uid);
+
+    if (result.success) {
+        sessionManager.setAuth(result.token, result.role, uid);
+        currentState = STATE_IDLE_AUTH;
+        statusLed.setPattern(PATTERN_AUTH_SUCCESS);
+
+        Serial.printf("[Main] Welcome, %s (%s)!\n", result.name.c_str(), result.role.c_str());
+
+        delay(2000);
+        statusLed.setPattern(PATTERN_SOLID);
+    } else {
+        Serial.printf("[Main] Auth failed: %s\n", result.error.c_str());
+        currentState = STATE_IDLE_UNAUTH;
+        statusLed.setPattern(PATTERN_OFF);
+    }
+
+// ───────────────────────────────────────────────────────────────
+// 6. NOTES FOR RESTORATION
+// ───────────────────────────────────────────────────────────────
+// - Power: 3.7V battery to 3.3V pin works well for WiFi
+// - TX Power: Set to 2dBm in wifi_manager.cpp for stability
+// - Sleep Mode: Enabled after connection for power saving
+// - Backend URL: Defined in config.h (https://smart-university-api-1wa7.onrender.com)
+// - Health check: GET / returns 200 if backend is up
+// - Auth endpoint: POST /api/auth/rfid with {"rfid_tag": "UID"}
+// ───────────────────────────────────────────────────────────────
