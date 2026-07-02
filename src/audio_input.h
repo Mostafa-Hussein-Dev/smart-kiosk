@@ -4,44 +4,30 @@
 #include <driver/i2s.h>
 
 // ════════════════════════════════════════════════════════════════
-//  INMP441 I2S Microphone — clean rewrite
+//  INMP441 I2S Microphone
 //
 //  Captures mono 16 kHz / 16-bit PCM into a PSRAM buffer and wraps it
 //  in a RIFF/WAV container for upload to the backend STT endpoint.
 //
-//  Wiring (see config.h):
-//    INMP441 SCK -> GPIO 8   (BCLK)
-//    INMP441 WS  -> GPIO 15  (LRCL)
-//    INMP441 SD  -> GPIO 18  (data out of mic -> data in of ESP32)
-//    INMP441 L/R -> GND      (left channel)
-//    INMP441 VDD -> 3.3V,  GND -> GND
+//  KEY: the mic is read at 16-BIT, not 32-bit. In 16-bit mode the ESP32
+//  I2S captures the top 16 bits of the INMP441's 24-bit frame — already
+//  MSB-aligned and correctly scaled — so samples are used AS-IS, with no
+//  shift / gain / DC-blocker math. (This matches a known-working INMP441
+//  project. The previous 32-bit + manual-shift path only ever produced a
+//  flat noise floor that didn't track sound.)
 //
-//  Why the previous version recorded static:
-//    1. It used I2S_COMM_FORMAT_I2S_MSB. The INMP441 is standard Philips
-//       I2S -> use I2S_COMM_FORMAT_STAND_I2S, otherwise bits are
-//       mis-aligned and you get noise.
-//    2. The 32->16 bit conversion shift was arbitrary. The INMP441 puts
-//       24-bit data left-justified in a 32-bit slot, so the correct
-//       extraction is (raw >> 8) then scale, with a DC blocker.
-//    3. Channel slot can be flipped on the S3 — toggle MIC_LEFT_CHANNEL
-//       below if you capture silence.
+//  Wiring (see config.h): SCK->MIC_SCK_PIN, WS->MIC_WS_PIN,
+//  SD->MIC_SD_PIN, L/R->GND (left channel), VDD->3.3V, GND->GND.
 // ════════════════════════════════════════════════════════════════
 
-// INMP441 L/R -> GND => the mic drives the LEFT slot = ONLY_LEFT (=1).
-// Verified empirically on THIS board: ch=1 carries the mic (its noise floor is
-// present), ch=0 reads dead zeros (peak=0 rms=0). So this MUST stay 1.
+// Which I2S slot to read. Pair with the mic's L/R pin:
+//   L/R -> GND  => mic drives LEFT  -> use 1 (ONLY_LEFT)
+//   L/R -> 3.3V => mic drives RIGHT -> use 0 (ONLY_RIGHT)
 #define MIC_LEFT_CHANNEL  1
 
-// Extra digital gain in bits applied on top of the 24->16 down-shift.
-// Each +1 doubles the level (+6 dB). NOTE: the old value of 9 was tuned while
-// we were (wrongly) reading the empty slot's noise floor. On the correct slot
-// (MIC_LEFT_CHANNEL 0) real speech is ~512x louder, so 9 would clip hard.
-// At conversational level/distance ~5-6 puts speech near 30-55% peak.
-// Tune with the RMS self-test in [AudioIn] stats: raise to 7 if too quiet,
-// drop to 4 if peak pins at 32767 (clipping). With a healthy mic, TAPPING the
-// mic body or talking right against it must spike peak into the thousands+;
-// if it stays at the noise floor, the mic element is blocked/dead.
-#define MIC_GAIN_BITS     6
+// Optional software gain: a simple integer multiply (clamped). 1 = none
+// (matches the reference). Raise to 2 or 4 only if recordings are too quiet.
+#define MIC_GAIN          1
 
 class AudioInput {
 public:
@@ -76,24 +62,13 @@ public:
     // Print peak/RMS of the last recording so you can confirm real audio.
     void printStats();
 
-    // Dump raw 16-bit samples to Serial (debug only).
-    void setSerialDump(bool enable) { _serialDump = enable; }
-
 private:
     bool      _initialized;
     bool      _recording;
-    bool      _serialDump;
 
     uint8_t*  _pcmBuffer;       // 16-bit PCM, PSRAM
     size_t    _recordedBytes;
     size_t    _maxBytes;
 
     i2s_port_t _i2sPort;
-
-    // DC blocker (first-order high-pass) state
-    int32_t   _dcPrevIn;
-    int32_t   _dcPrevOut;
-
-    // Convert one 32-bit INMP441 word to a 16-bit PCM sample (+DC blocker)
-    inline int16_t convertSample(int32_t raw);
 };

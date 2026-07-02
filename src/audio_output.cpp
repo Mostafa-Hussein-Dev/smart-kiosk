@@ -37,7 +37,10 @@ void SpeakerOutput::begin() {
     s_out = new AudioOutputI2S(1 /* I2S_NUM_1 */, AudioOutputI2S::EXTERNAL_I2S, 32);
     s_out->SetPinout(SPK_BCLK_PIN, SPK_LRC_PIN, SPK_DOUT_PIN);
     s_out->SetOutputModeMono(true);   // MAX98357A is a mono amp
-    s_out->SetGain(0.7f);             // 0.0..4.0 — comfortable for speech
+    // Digital gain: 1.0 = full-scale (loudest CLEAN level). Values >1.0 clip.
+    // Get extra loudness from the amp's analog GAIN pin instead (tie GAIN->GND
+    // via 100k for 15dB, or straight to GND for 12dB; floating = 9dB default).
+    s_out->SetGain(1.0f);             // 0.0..4.0
 
     _initialized = true;
     Serial.printf("[SpeakerOut] MAX98357A ready (I2S1 BCLK=%d LRC=%d DOUT=%d)\n",

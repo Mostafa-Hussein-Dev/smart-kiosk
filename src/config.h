@@ -8,13 +8,13 @@
 // ════════════════════════════════════════════════════════════════
 
 // ─── Wi-Fi ───────────────────────────────────────────────
-#define WIFI_SSID     "Honor"
-#define WIFI_PASSWORD "12341234"
+#define WIFI_SSID     "Abo Arab"
+#define WIFI_PASSWORD "98754321"
 
 // ─── Backend ─────────────────────────────────────────────
 // Local dev server on this PC (must be on the same Wi-Fi as the kiosk).
 // Run: uvicorn app.main:app --host 0.0.0.0 --port 8000
-#define BACKEND_URL   "http://10.105.67.4:8000"
+#define BACKEND_URL   "http://192.168.10.196:8000"
 // Deployed fallback: "https://smart-university-api-1wa7.onrender.com"
 
 // ─── RC522 RFID (SPI — global FSPI bus) ──────────────────
@@ -40,10 +40,11 @@
 // Touch screen: NOT USED. Removed entirely to free GPIO 16/17.
 
 // ─── I2S Microphone (INMP441) — I2S port 0 ───────────────
+// On 40/39/41 — the pins the standalone test showed any life on.
 #define MIC_I2S_PORT  I2S_NUM_0
-#define MIC_SCK_PIN   8     // I2S bit clock (BCLK)
-#define MIC_WS_PIN    15    // I2S word select (LRCL)
-#define MIC_SD_PIN    18    // I2S data in (DOUT of mic)
+#define MIC_SCK_PIN   40    // I2S bit clock (BCLK)
+#define MIC_WS_PIN    39    // I2S word select (LRCL)
+#define MIC_SD_PIN    41    // I2S data in (DOUT of mic)
 // INMP441 L/R pin -> GND (left channel). VDD -> 3.3V.
 
 // ─── I2S Speaker Amp (MAX98357A) — I2S port 1 ────────────
@@ -51,11 +52,17 @@
 #define SPK_BCLK_PIN  21    // I2S bit clock
 #define SPK_LRC_PIN   47    // I2S word select (LRC)
 #define SPK_DOUT_PIN  48    // I2S data out (DIN of amp)
-// MAX98357A: VIN -> 5V, GND -> GND, SD -> VIN (always enabled),
-// GAIN -> floating (9dB default). Speaker: 8 ohm 5W to amp output.
+// MAX98357A: VIN -> 5V (NOT 3.3V — output power scales with supply),
+// GND -> GND, SD -> VIN (always enabled). GAIN pin for loudness:
+// 100k->GND = 15dB (loudest), direct->GND = 12dB, floating = 9dB.
+// Speaker: 8 ohm 5W to amp output.
 
 // ─── Onboard RGB LED (WS2812 NeoPixel) ───────────────────
-#define RGB_LED_PIN   41
+// Moved off 41 (now used by the mic). 38 = onboard RGB on ESP32-S3-DevKitC-1
+// v1.1 (the original board used 48, but that's our speaker DOUT). If the
+// status LED doesn't light after flashing, your board's onboard LED is on a
+// different pin — tell me and we'll pick a free one.
+#define RGB_LED_PIN   38
 
 // ─── Push-to-Talk Button ─────────────────────────────────
 #define PTT_BUTTON_PIN  42   // Momentary, active LOW (INPUT_PULLUP)
@@ -66,6 +73,15 @@
 
 // ─── RFID Debounce ───────────────────────────────────────
 #define RFID_DEBOUNCE_MS       2000     // ignore same UID within 2s
+
+// ─── Input source ────────────────────────────────────────
+// 1 = TEXT INPUT: the query is a sentence typed into the USB serial monitor
+//     (115200 baud, send a line + Enter). The backend answers and the speaker
+//     replies. Used while the I2S microphone is unavailable.
+// 0 = MIC INPUT: hold the PTT button and speak (live microphone).
+// Everything else (Wi-Fi, RFID auth, robot face, TTS playback) is identical
+// either way — this only swaps how the question is captured.
+#define USE_SERIAL_TEXT_INPUT  1
 
 // ─── Audio Constants ─────────────────────────────────────
 #define AUDIO_SAMPLE_RATE      16000

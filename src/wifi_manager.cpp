@@ -1,6 +1,7 @@
 #include "wifi_manager.h"
 #include "config.h"
 #include <WiFi.h>
+#include <esp_wifi.h>
 
 // Static member initialization
 bool WifiManager::_everConnected = false;
@@ -50,6 +51,16 @@ void WifiManager::begin() {
     WiFi.mode(WIFI_STA);
     delay(200);
 
+    // 1b. Unlock 2.4GHz channels 12-13. The default country policy limits the
+    //     radio to channels 1-11, so an AP that auto-selected ch 12/13 shows up
+    //     as NO_AP_FOUND even though it's a valid 2.4GHz network. MANUAL policy
+    //     with nchan=13 lets the board scan/join the full 1-13 range.
+    wifi_country_t country = { .cc = "01", .schan = 1, .nchan = 13,
+                               .max_tx_power = 84,
+                               .policy = WIFI_COUNTRY_POLICY_MANUAL };
+    esp_wifi_set_country(&country);
+    delay(50);
+
     // 2. Disable persistence (faster, no flash wear)
     WiFi.persistent(false);
     delay(50);
@@ -58,8 +69,10 @@ void WifiManager::begin() {
     WiFi.disconnect(false);
     delay(100);
 
-    // 4. CRITICAL: Set minimum TX power BEFORE RF starts
-    WiFi.setTxPower(WIFI_POWER_2dBm);  // matches the known-working config; gentle on the 3V3 LDO
+    // 4. Set TX power BEFORE RF starts. 2dBm (minimum) is too weak to reliably
+    //    scan/associate at distance (NO_AP_FOUND); 8.5dBm is a safe middle
+    //    ground still gentle on the 3V3 LDO.
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
     delay(100);
 
     // 5. Disable low power mode (web server needs responsive WiFi)
@@ -69,7 +82,7 @@ void WifiManager::begin() {
     // 6. Register event handler
     WiFi.onEvent(onWiFiEvent);
 
-    Serial.printf("[WiFi] Pre-configured: TX=2dBm, Sleep=DISABLED, Mode=STA\n");
+    Serial.printf("[WiFi] Pre-configured: TX=8.5dBm, Sleep=DISABLED, Mode=STA\n");
     Serial.printf("[WiFi] SSID: %s\n", WIFI_SSID);
 
     // Start connection (with minimal power spike due to pre-configuration)
@@ -96,8 +109,8 @@ void WifiManager::startConnection() {
     // ─── FIX #2: Pre-configure WiFi power settings BEFORE begin() ──────────
     // These settings MUST be applied BEFORE WiFi.begin() to reduce initial power spike
 
-    // Set minimum TX power first (reduces RF power during calibration)
-    WiFi.setTxPower(WIFI_POWER_2dBm);  // matches the known-working config; gentle on the 3V3 LDO
+    // Set TX power first (reduces RF power during calibration)
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
     delay(50);
 
     // Disable low power mode (web server needs responsive WiFi)

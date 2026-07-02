@@ -58,14 +58,25 @@ unsigned long lastFaceDraw = 0;
 // the mouth animation) and let the audio pump run on every iteration instead.
 #define FACE_FRAME_MS  150
 
+// Idle prompt wording depends on how the user asks a question.
+#if USE_SERIAL_TEXT_INPUT
+  #define TALK_HINT "type to talk"
+#else
+  #define TALK_HINT "hold to talk"
+#endif
+
 // PTT edge detection (debounced)
 bool pttPrev = false;
+
+// Pending typed question (serial-text input mode), consumed in STATE_SENDING.
+String pendingText;
 
 // ─── Forward declarations ────────────────────────────────
 void handleRfidTap(const String& uid);
 void goIdle();
 void goError(const char* msg);
 bool pttPressed();
+bool readSerialLine(String& out);
 String shorten(const String& s, size_t n);
 
 // ─── Setup ───────────────────────────────────────────────
@@ -115,7 +126,9 @@ void setup() {
 
     // Peripherals
     rfidReader.begin();
+#if !USE_SERIAL_TEXT_INPUT
     if (!audioInput.begin())  Serial.println("[Main] WARNING: mic init failed");
+#endif
     audioOutput.begin();
 
     pinMode(PTT_BUTTON_PIN, INPUT_PULLUP);
@@ -124,7 +137,12 @@ void setup() {
     RobotFace::setDisplayMode(MODE_ROBOT);
     goIdle();
 
-    Serial.println("[Main] Ready.\n");
+    Serial.println("[Main] Ready.");
+#if USE_SERIAL_TEXT_INPUT
+    Serial.println("[Main] TEXT MODE: type your question here + Enter to ask.\n");
+#else
+    Serial.println("[Main] Hold the PTT button and speak.\n");
+#endif
 }
 
 // ─── Main loop ───────────────────────────────────────────
@@ -149,7 +167,7 @@ void loop() {
                 greetUntil = 0;
                 robotFace.setExpression(FACE_IDLE);
                 String n = sessionManager.getName();
-                robotFace.setStatusText(n.length() ? n + " - hold to talk" : "");
+                robotFace.setStatusText(n.length() ? n + " - " TALK_HINT : "");
             }
 
             // Animate face
@@ -169,6 +187,24 @@ void loop() {
                 break;
             }
 
+#if USE_SERIAL_TEXT_INPUT
+            // Typed question over the USB serial monitor (microphone replacement).
+            String line;
+            if (readSerialLine(line)) {
+                if (!wifiManager.isConnected()) {
+                    goError("No Wi-Fi");
+                } else {
+                    sessionManager.recordActivity();
+                    pendingText = line;
+                    Serial.printf("[Main] You asked: \"%s\"\n", line.c_str());
+                    robotFace.setStatusText("");
+                    robotFace.setExpression(FACE_THINKING);
+                    robotFace.draw();
+                    statusLed.setPattern(PATTERN_FAST_BLINK);
+                    currentState = STATE_SENDING;
+                }
+            }
+#else
             // PTT press edge -> start recording
             if (ptt && !pttPrev) {
                 if (!wifiManager.isConnected()) {
@@ -183,9 +219,11 @@ void loop() {
                     currentState = STATE_RECORDING;
                 }
             }
+#endif
             break;
         }
 
+#if !USE_SERIAL_TEXT_INPUT
         case STATE_RECORDING: {
             audioInput.loop();                 // pump capture EVERY iteration
 
@@ -213,13 +251,25 @@ void loop() {
             }
             break;
         }
+#endif
 
         case STATE_SENDING: {
+            String token = sessionManager.getToken();   // empty = public
+#if USE_SERIAL_TEXT_INPUT
+            VoiceChatResult r = apiClient.postTextChat(
+                pendingText, sessionManager.getSessionId(), token);
+
+            // Token expired -> retry once as public
+            if (r.httpCode == 401 && !token.isEmpty()) {
+                Serial.println("[Main] 401 -> retry public");
+                sessionManager.clearAuth();
+                r = apiClient.postTextChat(pendingText, "", "");
+            }
+#else
             size_t wavLen = 0;
             uint8_t* wav = audioInput.getWavData(&wavLen);
             if (!wav || wavLen == 0) { goError("No audio"); break; }
 
-            String token = sessionManager.getToken();   // empty = public
             VoiceChatResult r = apiClient.postVoiceChat(
                 wav, wavLen, sessionManager.getSessionId(), token);
             free(wav);
@@ -234,10 +284,11 @@ void loop() {
                     free(wav);
                 }
             }
+#endif
 
             if (r.success && r.mp3Data && r.mp3Length > 0) {
                 if (!r.sessionId.isEmpty()) sessionManager.setSessionId(r.sessionId);
-                Serial.printf("[Main] You said: \"%s\"\n", r.transcription.c_str());
+                Serial.printf("[Main] Answering: \"%s\"\n", r.transcription.c_str());
                 robotFace.setStatusText(shorten(r.transcription, 28));
                 robotFace.setExpression(FACE_SPEAKING);
                 robotFace.draw();            // do the costly FULL redraw now,
@@ -294,7 +345,7 @@ void goIdle() {
     robotFace.setExpression(FACE_IDLE);
     if (authed) {
         String n = sessionManager.getName();
-        robotFace.setStatusText(n.length() ? n + " - hold to talk" : "");
+        robotFace.setStatusText(n.length() ? n + " - " TALK_HINT : "");
     } else {
         robotFace.setStatusText("");   // default "How can I help?"
     }
@@ -365,6 +416,27 @@ bool pttPressed() {
     if (raw != lastRaw) { lastRaw = raw; t = millis(); }
     if (millis() - t > 30) stable = raw;
     return stable;
+}
+
+// ─── Non-blocking serial line reader ─────────────────────
+// Accumulates characters from the USB serial monitor until Enter (\n). Returns
+// true once when a complete, non-empty line is ready (trimmed) in `out`.
+bool readSerialLine(String& out) {
+    static String buf;
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\r') continue;              // ignore CR (CRLF line endings)
+        if (c == '\n') {
+            out = buf;
+            buf = "";
+            out.trim();
+            if (out.length() > 0) return true;
+            return false;                     // blank line -> ignore
+        }
+        buf += c;
+        if (buf.length() > 200) buf = "";     // guard against runaway input
+    }
+    return false;
 }
 
 // ─── Truncate a string for the status line ───────────────

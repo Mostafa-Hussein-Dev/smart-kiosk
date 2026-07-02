@@ -23,13 +23,10 @@ static_assert(sizeof(WAVHeader) == 44, "WAVHeader must be 44 bytes");
 AudioInput::AudioInput()
     : _initialized(false)
     , _recording(false)
-    , _serialDump(false)
     , _pcmBuffer(nullptr)
     , _recordedBytes(0)
     , _maxBytes(0)
     , _i2sPort(MIC_I2S_PORT)
-    , _dcPrevIn(0)
-    , _dcPrevOut(0)
 {
 }
 
@@ -58,20 +55,21 @@ bool AudioInput::begin() {
     Serial.printf("[AudioIn] PCM buffer: %u bytes in %s\n",
                   (unsigned)_maxBytes, psramFound() ? "PSRAM" : "RAM");
 
-    // I2S RX config — standard Philips format is the key fix.
+    // I2S RX config. 16-bit (not 32) so the peripheral hands us the top 16
+    // bits of the INMP441's 24-bit frame, ready to use with no shifting.
     i2s_config_t cfg = {};
     cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
     cfg.sample_rate          = AUDIO_SAMPLE_RATE;
-    cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT;   // INMP441 sends 32-bit frames
+    cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
 #if MIC_LEFT_CHANNEL
     cfg.channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT;
 #else
     cfg.channel_format       = I2S_CHANNEL_FMT_ONLY_RIGHT;
 #endif
-    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;   // <-- was I2S_MSB (caused static)
+    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
     cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
-    cfg.dma_buf_count        = 16;     // ~256 ms of DMA headroom (16 x 256 @ 16kHz)
-    cfg.dma_buf_len          = 256;    // so a slow TFT redraw can't overflow the ring
+    cfg.dma_buf_count        = 8;
+    cfg.dma_buf_len          = 1024;   // 8 x 1024 @ 16kHz = ~512 ms headroom
     cfg.use_apll             = false;
     cfg.tx_desc_auto_clear   = false;
     cfg.fixed_mclk           = 0;
@@ -99,9 +97,9 @@ bool AudioInput::begin() {
 
     i2s_zero_dma_buffer(_i2sPort);
 
-    Serial.printf("[AudioIn] Ready: SCK=%d WS=%d SD=%d, %d Hz mono, slot=%s, gain=%d bits\n",
+    Serial.printf("[AudioIn] Ready: SCK=%d WS=%d SD=%d, %d Hz mono 16-bit, slot=%s\n",
                   MIC_SCK_PIN, MIC_WS_PIN, MIC_SD_PIN, AUDIO_SAMPLE_RATE,
-                  MIC_LEFT_CHANNEL ? "LEFT" : "RIGHT", MIC_GAIN_BITS);
+                  MIC_LEFT_CHANNEL ? "LEFT" : "RIGHT");
     _initialized = true;
     return true;
 }
@@ -109,8 +107,6 @@ bool AudioInput::begin() {
 void AudioInput::startRecording() {
     if (!_initialized) return;
     _recordedBytes = 0;
-    _dcPrevIn = 0;
-    _dcPrevOut = 0;
     i2s_zero_dma_buffer(_i2sPort);   // drop stale samples / startup pop
     _recording = true;
     Serial.println("[AudioIn] >>> recording");
@@ -125,37 +121,12 @@ void AudioInput::stopRecording() {
     printStats();
 }
 
-// First-order DC blocker + gain. raw = 32-bit I2S word.
-inline int16_t AudioInput::convertSample(int32_t raw) {
-    // INMP441: 24-bit data left-justified in 32 bits -> arithmetic >>8.
-    int32_t s = raw >> 8;                 // signed 24-bit value
-    // Scale 24-bit -> 16-bit. Baseline is >>8; MIC_GAIN_BITS reduces that
-    // shift to add digital gain. Above 8 it becomes a LEFT shift (more gain).
-    // (The old `s >> (8 - MIC_GAIN_BITS)` was undefined for gain > 8.)
-    const int shift = 8 - MIC_GAIN_BITS;
-    if (shift >= 0) s >>= shift;
-    else            s <<= (-shift);
-
-    // DC blocker: y[n] = x[n] - x[n-1] + R*y[n-1], R ~= 0.99 (1013/1024)
-    int32_t y = s - _dcPrevIn + ((_dcPrevOut * 1013) >> 10);
-    _dcPrevIn  = s;
-    _dcPrevOut = y;
-
-    if (y >  32767) y =  32767;
-    if (y < -32768) y = -32768;
-    return (int16_t)y;
-}
-
 void AudioInput::loop() {
     if (!_initialized || !_recording) return;
 
-    // Drain the ENTIRE I2S RX DMA ring on every call. Previously this read a
-    // single 256-sample chunk (~16 ms) per main-loop iteration, but each
-    // iteration also runs the slow TFT face redraw (~60 ms). The mic kept
-    // filling the DMA ring faster than we emptied it, so it overflowed and
-    // dropped ~80% of the audio — capping recordings at ~0.4 s no matter how
-    // long PTT was held. Looping with a 0-tick timeout empties whatever has
-    // accumulated since the last call, then returns.
+    // Drain the I2S RX DMA on every call (0-tick timeout). This keeps a slow
+    // TFT face redraw between calls from letting the ring overflow. Samples
+    // are read straight into the PCM buffer as 16-bit — no conversion.
     for (;;) {
         if (_recordedBytes >= _maxBytes) {       // buffer full -> auto-stop
             Serial.println("[AudioIn] buffer full");
@@ -163,25 +134,26 @@ void AudioInput::loop() {
             return;
         }
 
-        // Read a chunk of 32-bit samples (256 samples = 1KB)
-        int32_t raw[256];
+        size_t room   = _maxBytes - _recordedBytes;
+        size_t toRead  = room < 2048 ? room : 2048;
         size_t bytesRead = 0;
-        esp_err_t err = i2s_read(_i2sPort, raw, sizeof(raw), &bytesRead, 0);
+        esp_err_t err = i2s_read(_i2sPort, _pcmBuffer + _recordedBytes,
+                                 toRead, &bytesRead, 0);
         if (err != ESP_OK || bytesRead == 0) return;   // ring empty -> done
 
-        size_t samples = bytesRead / sizeof(int32_t);
-        int16_t* out = (int16_t*)(_pcmBuffer + _recordedBytes);
-        size_t room = (_maxBytes - _recordedBytes) / 2;   // 16-bit slots left
-        if (samples > room) samples = room;
-
-        for (size_t i = 0; i < samples; i++) {
-            int16_t pcm = convertSample(raw[i]);
-            out[i] = pcm;
-            if (_serialDump) Serial.println(pcm);
+#if MIC_GAIN > 1
+        int16_t* s = (int16_t*)(_pcmBuffer + _recordedBytes);
+        size_t n = bytesRead / 2;
+        for (size_t i = 0; i < n; i++) {
+            int32_t v = (int32_t)s[i] * MIC_GAIN;
+            if (v >  32767) v =  32767;
+            if (v < -32768) v = -32768;
+            s[i] = (int16_t)v;
         }
-        _recordedBytes += samples * 2;
+#endif
+        _recordedBytes += bytesRead;
 
-        if (bytesRead < sizeof(raw)) return;   // partial read -> ring drained
+        if (bytesRead < toRead) return;   // partial read -> ring drained
     }
 }
 
@@ -201,7 +173,7 @@ void AudioInput::printStats() {
     Serial.printf("[AudioIn] stats: peak=%d rms=%.0f (%.0f%% full scale)\n",
                   (int)peak, rms, (rms / 32768.0) * 100.0);
     if (peak < 200) {
-        Serial.println("[AudioIn] WARNING: very low level — check wiring or flip MIC_LEFT_CHANNEL / raise MIC_GAIN_BITS");
+        Serial.println("[AudioIn] WARNING: very low level — check wiring / mic");
     }
 }
 
