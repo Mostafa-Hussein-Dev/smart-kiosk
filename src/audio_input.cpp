@@ -27,6 +27,8 @@ AudioInput::AudioInput()
     , _recordedBytes(0)
     , _maxBytes(0)
     , _i2sPort(MIC_I2S_PORT)
+    , _dcPrevIn(0)
+    , _dcPrevOut(0)
 {
 }
 
@@ -55,12 +57,12 @@ bool AudioInput::begin() {
     Serial.printf("[AudioIn] PCM buffer: %u bytes in %s\n",
                   (unsigned)_maxBytes, psramFound() ? "PSRAM" : "RAM");
 
-    // I2S RX config. 16-bit (not 32) so the peripheral hands us the top 16
-    // bits of the INMP441's 24-bit frame, ready to use with no shifting.
+    // I2S RX config — 32-bit (standard INMP441 read). The mic sends 24-bit
+    // data left-justified in a 32-bit word; convertSample() extracts it.
     i2s_config_t cfg = {};
     cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
     cfg.sample_rate          = AUDIO_SAMPLE_RATE;
-    cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
+    cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT;
 #if MIC_LEFT_CHANNEL
     cfg.channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT;
 #else
@@ -69,7 +71,7 @@ bool AudioInput::begin() {
     cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
     cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
     cfg.dma_buf_count        = 8;
-    cfg.dma_buf_len          = 1024;   // 8 x 1024 @ 16kHz = ~512 ms headroom
+    cfg.dma_buf_len          = 512;    // 8 x 512 @ 16kHz = ~256 ms headroom
     cfg.use_apll             = false;
     cfg.tx_desc_auto_clear   = false;
     cfg.fixed_mclk           = 0;
@@ -97,9 +99,9 @@ bool AudioInput::begin() {
 
     i2s_zero_dma_buffer(_i2sPort);
 
-    Serial.printf("[AudioIn] Ready: SCK=%d WS=%d SD=%d, %d Hz mono 16-bit, slot=%s\n",
+    Serial.printf("[AudioIn] Ready: SCK=%d WS=%d SD=%d, %d Hz mono 32->16bit, slot=%s, gain=%d bits\n",
                   MIC_SCK_PIN, MIC_WS_PIN, MIC_SD_PIN, AUDIO_SAMPLE_RATE,
-                  MIC_LEFT_CHANNEL ? "LEFT" : "RIGHT");
+                  MIC_LEFT_CHANNEL ? "LEFT" : "RIGHT", MIC_GAIN_BITS);
     _initialized = true;
     return true;
 }
@@ -107,9 +109,29 @@ bool AudioInput::begin() {
 void AudioInput::startRecording() {
     if (!_initialized) return;
     _recordedBytes = 0;
+    _dcPrevIn = 0;
+    _dcPrevOut = 0;
     i2s_zero_dma_buffer(_i2sPort);   // drop stale samples / startup pop
     _recording = true;
     Serial.println("[AudioIn] >>> recording");
+}
+
+// Convert one 32-bit INMP441 word to 16-bit PCM.
+inline int16_t AudioInput::convertSample(int32_t raw) {
+    // 24-bit data is left-justified in the 32-bit word. Shift down toward
+    // 16-bit; MIC_GAIN_BITS reduces the shift to add level (>>16 = unity).
+    int shift = 16 - MIC_GAIN_BITS;
+    int32_t s = shift >= 0 ? (raw >> shift) : (raw << (-shift));
+
+    // DC blocker: y[n] = x[n] - x[n-1] + R*y[n-1], R ~= 0.99 (1013/1024).
+    // Removes the INMP441's DC offset and the record-start pop.
+    int32_t y = s - _dcPrevIn + ((_dcPrevOut * 1013) >> 10);
+    _dcPrevIn  = s;
+    _dcPrevOut = y;
+
+    if (y >  32767) y =  32767;
+    if (y < -32768) y = -32768;
+    return (int16_t)y;
 }
 
 void AudioInput::stopRecording() {
@@ -124,9 +146,9 @@ void AudioInput::stopRecording() {
 void AudioInput::loop() {
     if (!_initialized || !_recording) return;
 
-    // Drain the I2S RX DMA on every call (0-tick timeout). This keeps a slow
-    // TFT face redraw between calls from letting the ring overflow. Samples
-    // are read straight into the PCM buffer as 16-bit — no conversion.
+    // Drain the I2S RX DMA on every call (0-tick timeout) so a slow TFT face
+    // redraw between calls can't let the ring overflow. Read 32-bit words and
+    // convert each to a 16-bit PCM sample into the buffer.
     for (;;) {
         if (_recordedBytes >= _maxBytes) {       // buffer full -> auto-stop
             Serial.println("[AudioIn] buffer full");
@@ -134,26 +156,22 @@ void AudioInput::loop() {
             return;
         }
 
-        size_t room   = _maxBytes - _recordedBytes;
-        size_t toRead  = room < 2048 ? room : 2048;
+        int32_t raw[256];
         size_t bytesRead = 0;
-        esp_err_t err = i2s_read(_i2sPort, _pcmBuffer + _recordedBytes,
-                                 toRead, &bytesRead, 0);
+        esp_err_t err = i2s_read(_i2sPort, raw, sizeof(raw), &bytesRead, 0);
         if (err != ESP_OK || bytesRead == 0) return;   // ring empty -> done
 
-#if MIC_GAIN > 1
-        int16_t* s = (int16_t*)(_pcmBuffer + _recordedBytes);
-        size_t n = bytesRead / 2;
-        for (size_t i = 0; i < n; i++) {
-            int32_t v = (int32_t)s[i] * MIC_GAIN;
-            if (v >  32767) v =  32767;
-            if (v < -32768) v = -32768;
-            s[i] = (int16_t)v;
-        }
-#endif
-        _recordedBytes += bytesRead;
+        size_t samples = bytesRead / sizeof(int32_t);
+        int16_t* out = (int16_t*)(_pcmBuffer + _recordedBytes);
+        size_t room = (_maxBytes - _recordedBytes) / 2;   // 16-bit slots left
+        if (samples > room) samples = room;
 
-        if (bytesRead < toRead) return;   // partial read -> ring drained
+        for (size_t i = 0; i < samples; i++) {
+            out[i] = convertSample(raw[i]);
+        }
+        _recordedBytes += samples * 2;
+
+        if (bytesRead < sizeof(raw)) return;   // partial read -> ring drained
     }
 }
 

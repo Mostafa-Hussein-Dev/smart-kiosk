@@ -14,7 +14,6 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include "config.h"
-#include "status_led.h"
 #include "wifi_manager.h"
 #include "api_client.h"
 #include "rfid_reader.h"
@@ -23,6 +22,7 @@
 #include "audio_output.h"
 #include "display.h"
 #include "robot_face.h"
+#include "ui_console.h"
 
 // ─── State machine ───────────────────────────────────────
 enum State {
@@ -36,7 +36,6 @@ enum State {
 };
 
 // ─── Modules ─────────────────────────────────────────────
-StatusLed      statusLed;
 WifiManager    wifiManager;
 ApiClient      apiClient;
 RfidReader     rfidReader;
@@ -58,26 +57,18 @@ unsigned long lastFaceDraw = 0;
 // the mouth animation) and let the audio pump run on every iteration instead.
 #define FACE_FRAME_MS  150
 
-// Idle prompt wording depends on how the user asks a question.
-#if USE_SERIAL_TEXT_INPUT
-  #define TALK_HINT "type to talk"
-#else
-  #define TALK_HINT "hold to talk"
-#endif
+#define TALK_HINT "hold to talk"
 
 // PTT edge detection (debounced)
 bool pttPrev = false;
-
-// Pending typed question (serial-text input mode), consumed in STATE_SENDING.
-String pendingText;
 
 // ─── Forward declarations ────────────────────────────────
 void handleRfidTap(const String& uid);
 void goIdle();
 void goError(const char* msg);
 bool pttPressed();
-bool readSerialLine(String& out);
 String shorten(const String& s, size_t n);
+String urlDecode(const String& s);
 
 // ─── Setup ───────────────────────────────────────────────
 void setup() {
@@ -97,57 +88,74 @@ void setup() {
     if (psramFound()) Serial.printf("  free=%u KB", ESP.getFreePsram() / 1024);
     Serial.printf("\nFree heap: %u KB\n", ESP.getFreeHeap() / 1024);
 
-    // LED first (connecting)
-    statusLed.begin();
-    statusLed.setPattern(PATTERN_SLOW_BLINK);
-
-    // Keep the TFT panel + backlight OFF for now so they don't load the rail
-    // during the Wi-Fi radio power-on spike.
-    pinMode(TFT_LED_PIN, OUTPUT);
-    digitalWrite(TFT_LED_PIN, LOW);
-
-    // ── Bring up Wi-Fi FIRST, with the display still off and the CPU throttled
-    //    to 80 MHz, so almost nothing else is drawing during the radio inrush.
-    //    Let the supply/caps settle first. ──
-    delay(800);
+    // ── Bring the display up FIRST so the whole boot sequence is visible as an
+    //    on-screen console. The CPU stays at 80 MHz through Wi-Fi bring-up to
+    //    keep the 3.3 V rail calm during the radio inrush (the brownout DETECTOR
+    //    is already disabled above; the display backlight is the only extra
+    //    load, and that's fine on a good 5 V supply). ──
     setCpuFrequencyMhz(80);
-    wifiManager.begin();            // blocks up to ~30s
-    setCpuFrequencyMhz(240);
-    if (wifiManager.isConnected()) {
-        apiClient.healthCheck();    // best effort; wakes the Render backend
+    delay(400);
+    display.begin();                          // clean black panel (no color test)
+    digitalWrite(TFT_LED_PIN, TFT_BACKLIGHT_ON);
+
+    BootConsole console(display);
+    console.begin("SMART UNIVERSITY ASSISTANT");
+
+    console.step("Display  ILI9488");
+    console.ok("480x320");
+
+    console.step("PSRAM  8MB OPI");
+    if (psramFound()) {
+        char d[16]; snprintf(d, sizeof(d), "%u KB", ESP.getFreePsram() / 1024);
+        console.ok(d);
+    } else {
+        console.warn("none");
     }
 
-    // ── Now the radio is up and steady; bring up the display + face ──
-    display.begin();
-    for (int i = 0; i < 6; i++) { delay(100); yield(); }
-    digitalWrite(TFT_LED_PIN, TFT_BACKLIGHT_ON);
-    display.showSplashScreen();
-    robotFace.init();
+    console.step("Wi-Fi");
+    wifiManager.begin();                       // blocks up to ~30s
+    if (wifiManager.isConnected()) console.ok(wifiManager.getIP().c_str());
+    else                           console.fail("offline");
 
-    // Peripherals
+    setCpuFrequencyMhz(240);                   // radio settled — full speed now
+
+    console.step("Backend");
+    if (wifiManager.isConnected()) console.ok(apiClient.healthCheck() ? "online" : "waking");
+    else                           console.warn("no wifi");
+
+    console.step("RFID  RC522");
     rfidReader.begin();
-#if !USE_SERIAL_TEXT_INPUT
-    if (!audioInput.begin())  Serial.println("[Main] WARNING: mic init failed");
-#endif
-    audioOutput.begin();
+    console.ok();
+
+    console.step("Microphone  INMP441");
+    if (audioInput.begin()) console.ok();
+    else                    console.warn("init failed");
+
+    console.step("Speaker  MAX98357A");
+    audioOutput.begin();                       // warms up the amp (kills first-PTT pop)
+    console.ok("warmup");
+
+    console.done("ready.");
+    robotFace.init();
+    for (int i = 0; i < 10; i++) { delay(100); yield(); }   // ~1s to read the log
+
+    // Welcome / home screen, then hand the panel to the robot face
+    display.showSplashScreen();
 
     pinMode(PTT_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(PTT_LED_PIN, OUTPUT);
+    digitalWrite(PTT_LED_PIN, !PTT_LED_ON);    // ring off until pressed
 
-    // Hand the screen to the robot face for the rest of runtime
+    robotFace.setWifiConnected(wifiManager.isConnected());
     RobotFace::setDisplayMode(MODE_ROBOT);
     goIdle();
 
     Serial.println("[Main] Ready.");
-#if USE_SERIAL_TEXT_INPUT
-    Serial.println("[Main] TEXT MODE: type your question here + Enter to ask.\n");
-#else
     Serial.println("[Main] Hold the PTT button and speak.\n");
-#endif
 }
 
 // ─── Main loop ───────────────────────────────────────────
 void loop() {
-    statusLed.update();
     sessionManager.checkTimeouts();
 
     // Session expired while authenticated -> drop to unauth idle
@@ -157,6 +165,7 @@ void loop() {
     }
 
     bool ptt = pttPressed();
+    digitalWrite(PTT_LED_PIN, ptt ? PTT_LED_ON : !PTT_LED_ON);   // ring glows while held
 
     switch (currentState) {
 
@@ -178,6 +187,7 @@ void loop() {
             if (millis() - lastWifiCheck > 5000) {
                 lastWifiCheck = millis();
                 wifiManager.ensureConnected();
+                robotFace.setWifiConnected(wifiManager.isConnected());
             }
 
             // RFID tap?
@@ -187,24 +197,6 @@ void loop() {
                 break;
             }
 
-#if USE_SERIAL_TEXT_INPUT
-            // Typed question over the USB serial monitor (microphone replacement).
-            String line;
-            if (readSerialLine(line)) {
-                if (!wifiManager.isConnected()) {
-                    goError("No Wi-Fi");
-                } else {
-                    sessionManager.recordActivity();
-                    pendingText = line;
-                    Serial.printf("[Main] You asked: \"%s\"\n", line.c_str());
-                    robotFace.setStatusText("");
-                    robotFace.setExpression(FACE_THINKING);
-                    robotFace.draw();
-                    statusLed.setPattern(PATTERN_FAST_BLINK);
-                    currentState = STATE_SENDING;
-                }
-            }
-#else
             // PTT press edge -> start recording
             if (ptt && !pttPrev) {
                 if (!wifiManager.isConnected()) {
@@ -215,15 +207,12 @@ void loop() {
                     recordStart = millis();
                     robotFace.setStatusText("");
                     robotFace.setExpression(FACE_LISTENING);
-                    statusLed.setPattern(PATTERN_FAST_BLINK);
                     currentState = STATE_RECORDING;
                 }
             }
-#endif
             break;
         }
 
-#if !USE_SERIAL_TEXT_INPUT
         case STATE_RECORDING: {
             audioInput.loop();                 // pump capture EVERY iteration
 
@@ -242,7 +231,6 @@ void loop() {
                 if (bytes >= MIN_RECORD_BYTES) {
                     robotFace.setExpression(FACE_THINKING);
                     robotFace.draw();
-                    statusLed.setPattern(PATTERN_FAST_BLINK);
                     currentState = STATE_SENDING;
                 } else {
                     Serial.println("[Main] recording too short, ignoring");
@@ -251,21 +239,9 @@ void loop() {
             }
             break;
         }
-#endif
 
         case STATE_SENDING: {
             String token = sessionManager.getToken();   // empty = public
-#if USE_SERIAL_TEXT_INPUT
-            VoiceChatResult r = apiClient.postTextChat(
-                pendingText, sessionManager.getSessionId(), token);
-
-            // Token expired -> retry once as public
-            if (r.httpCode == 401 && !token.isEmpty()) {
-                Serial.println("[Main] 401 -> retry public");
-                sessionManager.clearAuth();
-                r = apiClient.postTextChat(pendingText, "", "");
-            }
-#else
             size_t wavLen = 0;
             uint8_t* wav = audioInput.getWavData(&wavLen);
             if (!wav || wavLen == 0) { goError("No audio"); break; }
@@ -284,16 +260,15 @@ void loop() {
                     free(wav);
                 }
             }
-#endif
 
             if (r.success && r.mp3Data && r.mp3Length > 0) {
                 if (!r.sessionId.isEmpty()) sessionManager.setSessionId(r.sessionId);
-                Serial.printf("[Main] Answering: \"%s\"\n", r.transcription.c_str());
-                robotFace.setStatusText(shorten(r.transcription, 28));
+                String said = urlDecode(r.transcription);
+                Serial.printf("[Main] Answering: \"%s\"\n", said.c_str());
+                robotFace.setStatusText(shorten(said, 28));
                 robotFace.setExpression(FACE_SPEAKING);
                 robotFace.draw();            // do the costly FULL redraw now,
                 lastFaceDraw = millis();     // before audio starts competing
-                statusLed.setPattern(PATTERN_DOUBLE_BLINK);
                 audioOutput.playFromBuffer(r.mp3Data, r.mp3Length);  // takes ownership
                 currentState = STATE_PLAYING;
             } else {
@@ -304,16 +279,14 @@ void loop() {
         }
 
         case STATE_PLAYING: {
-            audioOutput.loop();                // pump decoder EVERY iteration
-
-            // Throttle the slow TFT redraw so it can't underflow the speaker
-            // DMA. Pump the decoder again right after the redraw to refill the
-            // ring that drained while we were drawing.
+            // The MP3 decoder now runs on its own high-priority task, so the
+            // face redraw can no longer starve the speaker DMA. Just animate the
+            // mouth here; the background task keeps the I2S ring fed even while
+            // this ~40 ms TFT push is blocking loopTask.
             if (millis() - lastFaceDraw > FACE_FRAME_MS) {
                 robotFace.update();
                 robotFace.draw();
                 lastFaceDraw = millis();
-                audioOutput.loop();
             }
             if (!audioOutput.isPlaying()) {
                 Serial.println("[Main] playback done");
@@ -341,13 +314,14 @@ void loop() {
 void goIdle() {
     bool authed = sessionManager.isAuthenticated();
     currentState = authed ? STATE_IDLE_AUTH : STATE_IDLE_UNAUTH;
-    statusLed.setPattern(authed ? PATTERN_SOLID : PATTERN_OFF);
     robotFace.setExpression(FACE_IDLE);
     if (authed) {
         String n = sessionManager.getName();
+        robotFace.setUser(n.length() ? n : String("Signed in"));
         robotFace.setStatusText(n.length() ? n + " - " TALK_HINT : "");
     } else {
-        robotFace.setStatusText("");   // default "How can I help?"
+        robotFace.setUser("");         // -> "Guest" in the status band
+        robotFace.setStatusText("");   // -> default "How can I help?"
     }
     robotFace.forceRedraw();
 }
@@ -357,7 +331,6 @@ void goError(const char* msg) {
     Serial.printf("[Main] ERROR: %s\n", msg);
     currentState = STATE_ERROR;
     errorUntil = millis() + 3000;
-    statusLed.setPattern(PATTERN_ERROR);
     robotFace.setExpression(FACE_ERROR);
     robotFace.setStatusText(msg);
     robotFace.forceRedraw();
@@ -380,7 +353,6 @@ void handleRfidTap(const String& uid) {
     if (!wifiManager.isConnected()) { goError("No Wi-Fi"); return; }
 
     currentState = STATE_AUTH_PENDING;
-    statusLed.setPattern(PATTERN_FAST_BLINK);
     robotFace.setExpression(FACE_THINKING);
     robotFace.setStatusText("Authenticating...");
     robotFace.forceRedraw();
@@ -396,7 +368,7 @@ void handleRfidTap(const String& uid) {
     if (res.role == "student") name = apiClient.getStudentName(res.token);
     sessionManager.setName(name);
 
-    statusLed.setPattern(PATTERN_AUTH_SUCCESS);
+    robotFace.setUser(name.length() ? name : String("Signed in"));
     robotFace.setExpression(FACE_HAPPY);
     robotFace.setStatusText(name.length() ? "Hi, " + name + "!" : "Welcome!");
     robotFace.forceRedraw();
@@ -418,29 +390,30 @@ bool pttPressed() {
     return stable;
 }
 
-// ─── Non-blocking serial line reader ─────────────────────
-// Accumulates characters from the USB serial monitor until Enter (\n). Returns
-// true once when a complete, non-empty line is ready (trimmed) in `out`.
-bool readSerialLine(String& out) {
-    static String buf;
-    while (Serial.available()) {
-        char c = (char)Serial.read();
-        if (c == '\r') continue;              // ignore CR (CRLF line endings)
-        if (c == '\n') {
-            out = buf;
-            buf = "";
-            out.trim();
-            if (out.length() > 0) return true;
-            return false;                     // blank line -> ignore
-        }
-        buf += c;
-        if (buf.length() > 200) buf = "";     // guard against runaway input
-    }
-    return false;
-}
-
 // ─── Truncate a string for the status line ───────────────
 String shorten(const String& s, size_t n) {
     if (s.length() <= n) return s;
     return s.substring(0, n) + "...";
+}
+
+// ─── Percent-decode the transcription header (spaces %20, UTF-8 %XX) ──
+static int hexVal(char h) {
+    if (h >= '0' && h <= '9') return h - '0';
+    if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+    if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+    return -1;
+}
+String urlDecode(const String& s) {
+    String out;
+    out.reserve(s.length());
+    for (size_t i = 0; i < s.length(); i++) {
+        char c = s[i];
+        if (c == '%' && i + 2 < s.length()) {
+            int hi = hexVal(s[i + 1]), lo = hexVal(s[i + 2]);
+            if (hi >= 0 && lo >= 0) { out += (char)((hi << 4) | lo); i += 2; continue; }
+        }
+        if (c == '+') out += ' ';
+        else          out += c;
+    }
+    return out;
 }

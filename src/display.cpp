@@ -38,14 +38,7 @@ void Display::begin() {
     pinMode(TFT_LED_PIN, OUTPUT);
     digitalWrite(TFT_LED_PIN, TFT_BACKLIGHT_ON);
 
-    // Quick color test (minimal delay to avoid watchdog)
-    Serial.println("[Display] Color test...");
-    tft.fillScreen(TFT_RED);
-    delay(100); yield();
-    tft.fillScreen(TFT_GREEN);
-    delay(100); yield();
-    tft.fillScreen(TFT_BLUE);
-    delay(100); yield();
+    // Start on a clean black panel (the old RGB color test was removed).
     tft.fillScreen(TFT_BLACK);
 
     Serial.println("[Display] ========== TFT INIT COMPLETE ==========");
@@ -148,53 +141,34 @@ int16_t Display::getTextHeight() {
 void Display::showSplashScreen() {
     if (!_initialized) return;
 
-    Serial.println("[Display] showSplashScreen() called");
+    Serial.println("[Display] welcome screen");
 
-    // Fill screen with BLACK
-    tft.fillScreen(TFT_BLACK);
-    Serial.println("[Display] Filled screen black");
+    tft.fillScreen(UI_BG);
 
-    // Draw a large white rectangle at top (header)
-    tft.fillRect(0, 0, _width, 60, TFT_WHITE);
-    Serial.println("[Display] Drew white header");
+    // Two bright-blue rounded "eyes" peeking at the top — same identity as the
+    // idle robot face.
+    tft.fillRoundRect(214, 72, 44, 66, 22, EYE_BLUE);
+    tft.fillRoundRect(266, 72, 44, 66, 22, EYE_BLUE);
 
-    // Draw black text on white header
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setTextFont(1);
+    tft.setTextDatum(MC_DATUM);
+
     tft.setTextSize(3);
-    tft.setCursor(70, 25);
-    tft.println("UNIVERSITY");
-    Serial.println("[Display] Drew header text");
+    tft.setTextColor(UI_TXT, UI_BG);
+    tft.drawString("Hello", _width / 2, 184);
 
-    // Draw white text on black body
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setTextSize(2);
-    tft.setCursor(100, 120);
-    tft.println("Smart");
-    tft.setCursor(100, 150);
-    tft.println("Assistant");
-    Serial.println("[Display] Drew body text");
+    tft.setTextColor(UI_ACCENT, UI_BG);
+    tft.drawString("Smart University Assistant", _width / 2, 222);
 
-    // Draw a green button at bottom
-    tft.fillRoundRect(140, 240, 200, 50, 10, TFT_GREEN);
-    tft.setTextColor(TFT_BLACK, TFT_GREEN);
-    tft.setTextSize(2);
-    tft.setCursor(175, 260);
-    tft.println("START");
-    Serial.println("[Display] Drew green button");
+    tft.setTextColor(UI_DIM, UI_BG);
+    tft.drawString("Tap your card to sign in", _width / 2, 258);
+    tft.setTextSize(1);
+    tft.drawString("or hold the button to talk", _width / 2, 284);
 
-    // Draw red corners (test pattern)
-    tft.fillCircle(20, 20, 10, TFT_RED);
-    tft.fillCircle(_width-20, 20, 10, TFT_RED);
-    tft.fillCircle(20, _height-20, 10, TFT_RED);
-    tft.fillCircle(_width-20, _height-20, 10, TFT_RED);
-    Serial.println("[Display] Drew red corner dots");
+    tft.setTextDatum(TL_DATUM);
 
-    // Reduced splash delay (1.5s instead of 3s) to avoid watchdog
-    for (int i = 0; i < 15; i++) {
-        delay(100);
-        yield();
-    }
-    Serial.println("[Display] Splash done, going to idle");
+    for (int i = 0; i < 16; i++) { delay(100); yield(); }   // ~1.6s
 }
 
 void Display::showIdleScreen(const char* message) {

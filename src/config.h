@@ -8,13 +8,13 @@
 // ════════════════════════════════════════════════════════════════
 
 // ─── Wi-Fi ───────────────────────────────────────────────
-#define WIFI_SSID     "Abo Arab"
-#define WIFI_PASSWORD "98754321"
+#define WIFI_SSID     "Honor"
+#define WIFI_PASSWORD "12341234"
 
 // ─── Backend ─────────────────────────────────────────────
 // Local dev server on this PC (must be on the same Wi-Fi as the kiosk).
 // Run: uvicorn app.main:app --host 0.0.0.0 --port 8000
-#define BACKEND_URL   "http://192.168.10.196:8000"
+#define BACKEND_URL   "http://10.187.48.98:8000"
 // Deployed fallback: "https://smart-university-api-1wa7.onrender.com"
 
 // ─── RC522 RFID (SPI — global FSPI bus) ──────────────────
@@ -33,9 +33,9 @@
 #define TFT_MOSI_PIN   9
 #define TFT_SCK_PIN    4
 #define TFT_MISO_PIN  -1
-#define TFT_LED_PIN   16   // Backlight control (GPIO 16, now exclusive — touch removed)
+#define TFT_LED_PIN   16   // Backlight control (GPIO 16)
 #define TFT_BACKLIGHT_ON HIGH
-#define TFT_ROTATION  1    // Landscape (480x320)
+#define TFT_ROTATION  3    // Landscape (480x320), flipped 180
 
 // Touch screen: NOT USED. Removed entirely to free GPIO 16/17.
 
@@ -57,15 +57,15 @@
 // 100k->GND = 15dB (loudest), direct->GND = 12dB, floating = 9dB.
 // Speaker: 8 ohm 5W to amp output.
 
-// ─── Onboard RGB LED (WS2812 NeoPixel) ───────────────────
-// Moved off 41 (now used by the mic). 38 = onboard RGB on ESP32-S3-DevKitC-1
-// v1.1 (the original board used 48, but that's our speaker DOUT). If the
-// status LED doesn't light after flashing, your board's onboard LED is on a
-// different pin — tell me and we'll pick a free one.
-#define RGB_LED_PIN   38
+// ─── Onboard RGB LED (WS2812) — REMOVED ──────────────────
+// The status-LED feature was removed; GPIO 38 is now free.
 
 // ─── Push-to-Talk Button ─────────────────────────────────
 #define PTT_BUTTON_PIN  42   // Momentary, active LOW (INPUT_PULLUP)
+// LED ring on the PTT button. Outer pin -> GPIO 8 through ~220 ohm resistor,
+// other outer pin -> GND. Driven HIGH while the button is held.
+#define PTT_LED_PIN     8
+#define PTT_LED_ON      HIGH
 
 // ─── Timeouts (milliseconds) ─────────────────────────────
 #define INACTIVITY_TIMEOUT_MS  300000   // 5 minutes auto-logout
@@ -73,15 +73,6 @@
 
 // ─── RFID Debounce ───────────────────────────────────────
 #define RFID_DEBOUNCE_MS       2000     // ignore same UID within 2s
-
-// ─── Input source ────────────────────────────────────────
-// 1 = TEXT INPUT: the query is a sentence typed into the USB serial monitor
-//     (115200 baud, send a line + Enter). The backend answers and the speaker
-//     replies. Used while the I2S microphone is unavailable.
-// 0 = MIC INPUT: hold the PTT button and speak (live microphone).
-// Everything else (Wi-Fi, RFID auth, robot face, TTS playback) is identical
-// either way — this only swaps how the question is captured.
-#define USE_SERIAL_TEXT_INPUT  1
 
 // ─── Audio Constants ─────────────────────────────────────
 #define AUDIO_SAMPLE_RATE      16000
@@ -92,6 +83,40 @@
 #define WAV_HEADER_SIZE        44
 // Minimum captured PCM bytes to bother sending (~0.25s) — rejects accidental taps
 #define MIN_RECORD_BYTES       8000
+
+// ─── UI / Robot face (480x320) ───────────────────────────
+// Build an RGB565 color from 8-bit components.
+#define RGB565(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
+
+// Palette (mirrors the approved mockup)
+#define EYE_BLUE   RGB565(0, 188, 255)   // bright blue eyes  (~0x05FF)
+#define EYE_RED    RGB565(255, 59, 48)   // error eyes
+#define UI_BG      RGB565(0, 0, 0)       // black panel
+#define UI_TXT     RGB565(223, 233, 238)
+#define UI_DIM     RGB565(111, 135, 148)
+#define UI_ACCENT  EYE_BLUE
+#define UI_OK      RGB565(61, 224, 122)  // boot console [ OK ]
+#define UI_WARN    RGB565(255, 194, 75)  // [WARN]
+#define UI_FAIL    RGB565(255, 92, 92)   // [FAIL]
+#define UI_PEND    RGB565(79, 182, 201)  // [ .. ] pending
+#define UI_BAND    RGB565(4, 20, 28)     // status band background
+
+// Eye geometry (centers, base size, corner radius)
+#define EYE_CY     168
+#define EYE_LX     165
+#define EYE_RX     315
+#define EYE_W      110
+#define EYE_H      132
+#define EYE_R      52
+
+// Waveform strip (speaking / listening)
+#define WAVE_Y     262
+#define WAVE_X0    116
+#define WAVE_X1    364
+#define WAVE_BARS  21
+
+// Top status band height
+#define BAND_H     26
 
 // ─── Pins to AVOID on ESP32-S3 ───────────────────────────
 // GPIO0  — BOOT strapping pin (left as boot/flash only)

@@ -9,12 +9,12 @@
 //  Captures mono 16 kHz / 16-bit PCM into a PSRAM buffer and wraps it
 //  in a RIFF/WAV container for upload to the backend STT endpoint.
 //
-//  KEY: the mic is read at 16-BIT, not 32-bit. In 16-bit mode the ESP32
-//  I2S captures the top 16 bits of the INMP441's 24-bit frame — already
-//  MSB-aligned and correctly scaled — so samples are used AS-IS, with no
-//  shift / gain / DC-blocker math. (This matches a known-working INMP441
-//  project. The previous 32-bit + manual-shift path only ever produced a
-//  flat noise floor that didn't track sound.)
+//  Read at 32-BIT (the standard INMP441 method): the mic sends 24-bit data
+//  left-justified in a 32-bit I2S word. We take (raw >> 8) as the signed
+//  24-bit sample, run a DC blocker (removes the mic's DC offset and the
+//  startup pop), apply MIC_GAIN_BITS of digital gain, and store 16-bit PCM.
+//  (Reading in 16-bit mode mis-aligns the INMP441 frame and produces glitchy
+//  full-scale spikes with no real speech — do not use it.)
 //
 //  Wiring (see config.h): SCK->MIC_SCK_PIN, WS->MIC_WS_PIN,
 //  SD->MIC_SD_PIN, L/R->GND (left channel), VDD->3.3V, GND->GND.
@@ -25,9 +25,11 @@
 //   L/R -> 3.3V => mic drives RIGHT -> use 0 (ONLY_RIGHT)
 #define MIC_LEFT_CHANNEL  1
 
-// Optional software gain: a simple integer multiply (clamped). 1 = none
-// (matches the reference). Raise to 2 or 4 only if recordings are too quiet.
-#define MIC_GAIN          1
+// Digital gain in BITS (each +1 = 2x / +6 dB), applied during 24->16
+// conversion. Tune from the [AudioIn] stats: raise if rms is only a couple %,
+// lower if peak pins at 32767 (clipping). 5 keeps strong speech ~20-25% RMS
+// without clipping; drop to 4 if it still pins peak.
+#define MIC_GAIN_BITS     5
 
 class AudioInput {
 public:
@@ -71,4 +73,11 @@ private:
     size_t    _maxBytes;
 
     i2s_port_t _i2sPort;
+
+    // DC blocker state (first-order high-pass; removes INMP441 DC offset)
+    int32_t   _dcPrevIn;
+    int32_t   _dcPrevOut;
+
+    // Convert one 32-bit INMP441 word -> 16-bit PCM (shift + gain + DC block)
+    inline int16_t convertSample(int32_t raw);
 };

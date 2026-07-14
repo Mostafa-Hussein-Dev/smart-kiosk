@@ -48,15 +48,4 @@ public:
         const String& sessionId,
         const String& bearerToken
     );
-
-    // Send a typed-text chat request (mic replacement). The backend skips STT,
-    // runs chat + TTS, and returns the same MP3 + headers as postVoiceChat.
-    //   text: the question as a plain string
-    //   sessionId: current session ID (empty for new session)
-    //   bearerToken: auth token (empty -> public endpoint)
-    VoiceChatResult postTextChat(
-        const String& text,
-        const String& sessionId,
-        const String& bearerToken
-    );
 };
