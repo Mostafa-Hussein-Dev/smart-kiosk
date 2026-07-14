@@ -12,10 +12,10 @@
 #define WIFI_PASSWORD "12341234"
 
 // ─── Backend ─────────────────────────────────────────────
-// Local dev server on this PC (must be on the same Wi-Fi as the kiosk).
-// Run: uvicorn app.main:app --host 0.0.0.0 --port 8000
-#define BACKEND_URL   "http://10.187.48.98:8000"
-// Deployed fallback: "https://smart-university-api-1wa7.onrender.com"
+// Deployed backend on Render (TLS auto-selected because it starts with https).
+#define BACKEND_URL   "https://smart-university-ng5p.onrender.com"
+// Local dev fallback (same Wi-Fi as the kiosk): "http://10.187.48.98:8000"
+//   Run: uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 // ─── RC522 RFID (SPI — global FSPI bus) ──────────────────
 #define RFID_SCK_PIN  12   // SPI SCK
